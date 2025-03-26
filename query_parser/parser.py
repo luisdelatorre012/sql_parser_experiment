@@ -9,12 +9,6 @@ class MultipleQueriesError(Exception):
     pass
 
 
-def remove_comments(query: str) -> str:
-    query_no_multiline = re.sub(r'/\*.*?\*/', '', query, flags=re.DOTALL)
-    query_no_comments = re.sub(r'--.*', '', query_no_multiline)
-    return query_no_comments.strip()
-
-
 def remove_parenthesized_content(query: str) -> str:
     result = []
     level: int = 0
@@ -31,9 +25,9 @@ def remove_parenthesized_content(query: str) -> str:
 
 
 def get_outer_tables(query: str) -> set[str]:
-    query_no_subq = remove_parenthesized_content(query)
+    query_without_subqueries = remove_parenthesized_content(query)
     pattern = r'\b(?:FROM|JOIN)\s+([^\s,;]+)'
-    tables = re.findall(pattern, query_no_subq, flags=re.IGNORECASE)
+    tables = re.findall(pattern, query_without_subqueries, flags=re.IGNORECASE)
     return set(tables)
 
 
@@ -104,16 +98,25 @@ def create_cte_definition(inner_subquery: str, alias: str) -> str:
     """
     Create the CTE definition string. If the subquery is scalar, modify the SELECT clause
     to include an alias "val" so that the outer query can reference it as {alias}.val.
+    If an aggregate function already has an alias, that alias is preserved.
     """
     if is_scalar_subquery(inner_subquery):
-        # Insert "AS val" before the FROM clause.
-        new_inner_subquery = re.sub(
-            r'(SELECT\s+.*?)(\s+FROM\s+)',
-            r'\1 AS val\2',
-            inner_subquery,
-            flags=re.IGNORECASE | re.DOTALL
-        )
-        return f"{alias} AS ({new_inner_subquery})"
+        # Check if there's already an alias in the SELECT clause
+        select_pattern = r'SELECT\s+(.*?)(?:\s+FROM\s+|$)'
+        select_match = re.search(select_pattern, inner_subquery, flags=re.IGNORECASE | re.DOTALL)
+
+        if select_match and not re.search(r'\bAS\s+\w+', select_match.group(1), flags=re.IGNORECASE):
+            # No alias found, add "AS val" before FROM clause
+            new_inner_subquery = re.sub(
+                r'(SELECT\s+.*?)(\s+FROM\s+)',
+                r'\1 AS val\2',
+                inner_subquery,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+            return f"{alias} AS ({new_inner_subquery})"
+
+        # Alias already exists, use the subquery as is
+        return f"{alias} AS ({inner_subquery})"
     else:
         return f"{alias} AS ({inner_subquery})"
 
@@ -122,19 +125,61 @@ def update_main_query_for_scalar_subqueries(main_query: str, uncorrelated_subque
     """
     For each scalar subquery, update the main query:
       - Replace unqualified references to the alias with a qualified version (alias.val).
-      - Insert a CROSS JOIN with the corresponding CTE.
+      - Insert a CROSS JOIN with the corresponding CTE for scalar subqueries not already in JOIN.
     """
+    # First, replace all scalar references with qualified versions
     for normalized, alias in uncorrelated_subqueries.items():
         if re.search(r'\b(AVG|SUM|COUNT|MIN|MAX)\(', normalized, flags=re.IGNORECASE):
+            # Don't modify aliases that appear in JOIN clauses
+            join_pattern = rf'(?i)JOIN\s+{alias}\b\s+(?:AS\s+)?(\w+)'
+            join_matches = re.finditer(join_pattern, main_query)
+
+            # Store the positions of JOIN aliases to avoid modifying them
+            join_positions = []
+            for match in join_matches:
+                start, end = match.span(0)
+                join_positions.append((start, end))
+
             # Replace alias references with qualified ones (i.e. alias.val)
+            # but only for references not in JOIN clauses
             pattern = rf'(?<!\.)\b{alias}\b'
-            main_query = re.sub(pattern, f"{alias}.val", main_query)
-            # Insert the CROSS JOIN just after the FROM clause.
-            main_query = re.sub(r'(FROM\s+\S+)', r'\1 CROSS JOIN ' + alias, main_query, count=1)
+            positions = []
+            for match in re.finditer(pattern, main_query):
+                start, end = match.span(0)
+                # Check if this match is within a JOIN clause
+                in_join = any(pos[0] <= start <= pos[1] for pos in join_positions)
+                if not in_join:
+                    positions.append((start, end))
+
+            # Replace from end to start to avoid position shifts
+            positions.sort(reverse=True)
+            for start, end in positions:
+                before = main_query[:start]
+                after = main_query[end:]
+                main_query = before + f"{alias}.val" + after
+
+    # Now collect all CTEs that need cross joins
+    ctes_to_join = []
+    for normalized, alias in uncorrelated_subqueries.items():
+        if re.search(r'\b(AVG|SUM|COUNT|MIN|MAX)\(', normalized, flags=re.IGNORECASE):
+            # Only add CROSS JOIN if the CTE is not already part of a JOIN
+            if not re.search(rf'(?i)JOIN\s+{alias}\b', main_query):
+                ctes_to_join.append(alias)
+
+    # Add all cross joins in proper order (matching CTE declaration order)
+    if ctes_to_join:
+        from_pattern = r'(FROM\s+\S+)'
+        from_match = re.search(from_pattern, main_query)
+        if from_match:
+            join_clause = " " + " ".join(f"CROSS JOIN {alias}" for alias in ctes_to_join)
+            before = main_query[:from_match.end()]
+            after = main_query[from_match.end():]
+            main_query = before + join_clause + after
+
     return main_query
 
 
-def transform_query_to_ctes(query: str) -> str:
+def transform_subqueries_to_ctes(query: str) -> str:
     """
     Transform the given SQL query by extracting uncorrelated and transformable subqueries
     and replacing them with CTE references. For scalar subqueries (detected heuristically via
@@ -175,7 +220,18 @@ def transform_query_to_ctes(query: str) -> str:
             cte_definition = create_cte_definition(inner_subquery, alias)
             cte_definitions.append(cte_definition)
 
-        transformed_query = transformed_query.replace(subquery_text, alias)
+        # Check if this subquery is part of a JOIN clause
+        join_pattern = rf'(?i)JOIN\s+{re.escape(subquery_text)}\s+(?:AS\s+)?(\w+)'
+        join_match = re.search(join_pattern, transformed_query)
+
+        if join_match:
+            # If subquery is used in JOIN, preserve the original join semantics
+            table_alias = join_match.group(1)
+            # Replace just the subquery part, preserving the JOIN and any alias
+            transformed_query = transformed_query.replace(subquery_text, alias)
+        else:
+            # For other contexts (WHERE, SELECT, etc.), replace the subquery directly
+            transformed_query = transformed_query.replace(subquery_text, alias)
 
     # If any CTEs were created, build the WITH clause and update scalar subquery references.
     if cte_definitions:
@@ -267,17 +323,15 @@ def transform_ctes_to_subqueries(query: str) -> str:
 # Example usage:
 if __name__ == "__main__":
     original_query = """
-    SELECT *
-    FROM orders
-    WHERE order_id IN (
-        SELECT order_id
-        FROM order_details
-        WHERE quantity > 10
-    )
+    SELECT a, 
+           (SELECT MAX(c) FROM table2) as max_c,
+           (SELECT MIN(d) FROM table3) as min_d
+    FROM table1
+    WHERE a > (SELECT AVG(e) FROM table4)
     """
 
     # Transform subqueries to CTEs.
-    cte_query = transform_query_to_ctes(original_query)
+    cte_query = transform_subqueries_to_ctes(original_query)
     print("Query with CTEs:")
     print(cte_query)
     print("\n-----------------\n")

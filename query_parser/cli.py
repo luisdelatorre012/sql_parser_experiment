@@ -1,7 +1,7 @@
 import click
 
 from query_parser import (
-    transform_query_to_ctes,
+    transform_subqueries_to_ctes,
     transform_ctes_to_subqueries,
     MultipleQueriesError
 )
@@ -47,7 +47,7 @@ def cli(input_file, output_file, mode) -> None:
         if mode.lower() == 'cte2sub':
             transformed_query: str = transform_ctes_to_subqueries(query)
         else:
-            transformed_query: str = transform_query_to_ctes(query)
+            transformed_query: str = transform_subqueries_to_ctes(query)
     except MultipleQueriesError as e:
         click.echo(f"Error: {e}", err=True)
         raise click.Abort()
