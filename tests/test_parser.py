@@ -290,10 +290,12 @@ def test_full_output_scalar_where() -> None:
     """
     query = "SELECT a, b FROM table1 WHERE a > (SELECT AVG(b) FROM table2)"
     expected = (
-        "WITH cte_0 AS ("
-        "SELECT AVG(b) AS val FROM table2"
-        ") "
-        "SELECT a, b FROM table1 CROSS JOIN cte_0 WHERE a > cte_0.val"
+        """
+        WITH cte_0 AS (
+            SELECT AVG(b) AS val FROM table2
+        )
+        SELECT a, b FROM table1 CROSS JOIN cte_0 WHERE a > cte_0.val        
+        """
     )
     result = transform_subqueries_to_ctes(query)
     normalized_result = ''.join(remove_whitespace(result).split())
@@ -306,19 +308,19 @@ def test_full_output_duplicate_scalar() -> None:
     Test a query where the same scalar subquery appears twice.
     Expected transformation:
     """
-    query = (
-        "SELECT a, "
-        "(SELECT MAX(c) FROM table2) as max_c, "
-        "(SELECT MAX(c) FROM table2) as another_max "
-        "FROM table1"
+    query = """
+        SELECT a,
+        (SELECT MAX(c) FROM table2) as max_c,
+        (SELECT MAX(c) FROM table2) as another_max
+        FROM table1
+        """
+    expected = """
+    WITH cte_0 AS (
+        SELECT MAX(c) AS val FROM table2
     )
-    expected = (
-        "WITH cte_0 AS ("
-        "SELECT MAX(c) AS val FROM table2"
-        ") "
-        "SELECT a, cte_0.val AS max_c, cte_0.val AS another_max "
-        "FROM table1 CROSS JOIN cte_0"
-    )
+    SELECT a, cte_0.val AS max_c, cte_0.val AS another_max
+    FROM table1 CROSS JOIN cte_0
+    """
     result = transform_subqueries_to_ctes(query)
     normalized_result = ''.join(remove_whitespace(result).split())
     normalized_expected = ''.join(remove_whitespace(expected).split())
@@ -340,8 +342,12 @@ def test_transform_ctes_to_subqueries_no_with() -> None:
 @pytest.mark.parametrize("query, expected", [
     (
             # Basic scalar subquery transformation:
-            "WITH cte_0 AS (SELECT AVG(b) AS val FROM table2) "
-            "SELECT a, b FROM table1 CROSS JOIN cte_0 WHERE a > cte_0.val",
+            """
+            WITH cte_0 AS (
+                SELECT AVG(b) AS val FROM table2
+            )
+            SELECT a, b FROM table1 CROSS JOIN cte_0 WHERE a > cte_0.val    
+            """,
             "SELECT a, b FROM table1 WHERE a > (SELECT AVG(b) AS VAL FROM table2)"
     ),
 ])
@@ -357,8 +363,16 @@ def test_transform_ctes_to_subqueries_basic(query: str, expected: str) -> None:
 @pytest.mark.parametrize("query, expected", [
     (
             # Duplicate scalar subqueries transformed back inline:
-            "WITH cte_0 AS (SELECT MAX(c) AS val FROM table2) "
-            "SELECT a, cte_0.val AS max_c, cte_0.val AS another_max FROM table1 CROSS JOIN cte_0",
+            """
+            WITH cte_0 AS (
+                SELECT MAX(c) AS val FROM table2
+            )
+            SELECT 
+                a, 
+                cte_0.val AS max_c, 
+                cte_0.val AS another_max 
+            FROM table1 CROSS JOIN cte_0
+            """,
             "SELECT a, (SELECT MAX(c) AS VAL FROM table2) AS max_c, (SELECT MAX(c) AS VAL  FROM table2) AS another_max FROM table1"
     ),
 ])
