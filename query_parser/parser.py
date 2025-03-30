@@ -272,33 +272,63 @@ def split_cte_definitions(cte_defs: str) -> list[str]:
     return definitions
 
 
+def extract_cte_definitions(query: str) -> tuple[str, str]:
+    """
+    Given a query starting with WITH, extract the CTE definitions part and the main query.
+    This function reads character-by-character and uses parenthesis balancing to determine
+    where the CTE definitions end and the main query begins.
+    Returns a tuple: (cte_definitions_str, main_query).
+    """
+    # Remove the initial "WITH" keyword.
+    remaining = re.sub(r"(?is)^\s*WITH\s+", "", query, count=1)
+    cte_part = []
+    i = 0
+    depth = 0
+    length = len(remaining)
+    main_query_start = None
+    while i < length:
+        # At depth 0, check if the remaining text begins with a DML keyword.
+        if depth == 0:
+            m = re.match(r"(?i)^(SELECT|INSERT|UPDATE|DELETE)\b", remaining[i:])
+            if m:
+                main_query_start = i
+                break
+        char = remaining[i]
+        cte_part.append(char)
+        if char == '(':
+            depth += 1
+        elif char == ')':
+            depth -= 1
+        i += 1
+    if main_query_start is None:
+        return ("".join(cte_part).strip(), "")
+    cte_defs_str = "".join(cte_part).strip()
+    main_query = remaining[main_query_start:].strip()
+    return (cte_defs_str, main_query)
+
+
 def transform_ctes_to_subqueries(query: str) -> str:
     """
-    Reverse the transformation done by transform_query_to_ctes().
+    Reverse the transformation done by transform_subqueries_to_ctes().
     If the query starts with a WITH clause defining CTEs, this function extracts those
     definitions and substitutes the CTE references in the main query with the original subqueries.
 
-    This function also removes CROSS JOINs inserted for scalar subqueries.
+    It also removes any CROSS JOINs inserted for scalar subqueries.
     """
-    # Check if the query starts with a WITH clause.
+    # Only process if the query starts with WITH.
     if not re.match(r"(?is)^\s*WITH\s+", query):
         return query
 
-    # Use regex to separate the WITH clause and the main query.
-    # This pattern assumes the main query starts with SELECT/INSERT/UPDATE/DELETE.
-    m = re.search(r"(?is)^\s*WITH\s+(.*?)\s+(SELECT\b.*)", query, flags=re.DOTALL)
-    if not m:
+    # Extract the CTE definitions block and the main query using the custom parser.
+    cte_defs_str, main_query = extract_cte_definitions(query)
+    if not main_query:
         return query
-
-    cte_defs_str = m.group(1).strip()
-    main_query = m.group(2)
 
     # Split individual CTE definitions.
     cte_def_list = split_cte_definitions(cte_defs_str)
     alias_to_subquery = {}
-
-    # Extract alias and subquery text from each CTE definition.
-    # Assumes definitions are of the form: alias AS ( subquery )
+    # Extract the alias and subquery text from each definition.
+    # Each definition is assumed to be of the form: alias AS ( subquery )
     for cte_def in cte_def_list:
         m_cte = re.match(r"(?is)^\s*(\S+)\s+AS\s*\((.*)\)\s*$", cte_def, flags=re.DOTALL)
         if m_cte:
@@ -306,13 +336,13 @@ def transform_ctes_to_subqueries(query: str) -> str:
             subquery_text = m_cte.group(2).strip()
             alias_to_subquery[alias] = subquery_text
 
-    # For each CTE alias, remove any inserted CROSS JOINs and replace references.
+    # For each CTE alias, remove any inserted CROSS JOINs and replace alias references in the main query.
     for alias, subquery in alias_to_subquery.items():
-        # Remove CROSS JOIN occurrences (case-insensitive) for this alias.
+        # Remove any CROSS JOIN clauses for this alias.
         main_query = re.sub(rf"(?is)\s+CROSS\s+JOIN\s+{alias}\b", " ", main_query)
-        # Replace qualified references (e.g. cte_0.val) first.
+        # First, replace qualified references (e.g. cte_0.val) with the inline subquery.
         main_query = re.sub(rf"(?<!\w){alias}\.val\b", f"({subquery})", main_query)
-        # Then replace unqualified references.
+        # Then, replace unqualified references to the alias.
         main_query = re.sub(rf"(?<!\w){alias}\b", f"({subquery})", main_query)
 
     # Optionally, format the final query.
