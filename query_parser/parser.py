@@ -1,7 +1,13 @@
+import sqlglot
 import sqlparse
+from sqlglot.expressions import AggFunc
 from sqlparse.sql import Parenthesis, Token
 from sqlparse.tokens import DML
 import re
+
+
+# TODO: what other parts of this can I replace with sqlglot?
+# TODO: add the sqlglot class from the other project. where should I put it in the directory structure?
 
 
 class MultipleQueriesError(Exception):
@@ -37,7 +43,7 @@ def find_subqueries(token_list: list[Token]) -> list[Token]:
         if isinstance(token, Parenthesis):
             if any(t.ttype is DML and t.value.upper() == 'SELECT' for t in token.tokens):
                 subqueries.append(token)
-        elif token.is_group:  # is_group is a boolean property.
+        elif token.is_group:
             subqueries.extend(find_subqueries(token.tokens))
     return subqueries
 
@@ -88,10 +94,34 @@ def normalize_subquery(subquery: str) -> str:
 
 def is_scalar_subquery(subquery: str) -> bool:
     """
-    Determine if a subquery is scalar by checking for aggregate functions.
-    (This heuristic is based on the presence of AVG, SUM, COUNT, MIN, or MAX.)
+    Determine if a subquery is scalar by checking for aggregate functions
+    or if it's structured to return a single value.
+
+    Uses sqlglot to parse the SQL and detect aggregate functions properly.
     """
-    return bool(re.search(r'\b(AVG|SUM|COUNT|MIN|MAX)\(', subquery, flags=re.IGNORECASE))
+
+    # Parse the SQL subquery
+    parsed = sqlglot.parse_one(subquery)
+
+    # Function to recursively check for aggregate functions in the AST
+    def has_aggregate(node):
+        if isinstance(node, AggFunc):
+            return True
+
+        # Check children nodes
+        if hasattr(node, 'args'):
+            for arg in node.args.values():
+                if isinstance(arg, list):
+                    for item in arg:
+                        if has_aggregate(item):
+                            return True
+                elif arg is not None:
+                    if has_aggregate(arg):
+                        return True
+        return False
+
+    # Check if the query contains any aggregate functions
+    return has_aggregate(parsed)
 
 
 def create_cte_definition(inner_subquery: str, alias: str) -> str:
@@ -245,9 +275,7 @@ def transform_subqueries_to_ctes(query: str) -> str:
     return formatted_query
 
 
-# --- New functionality: Transform CTEs back into inline subqueries --- #
-
-def split_cte_definitions(cte_defs: str) -> list[str]:
+def split_cte_definitions(cte_definitions: str) -> list[str]:
     """
     Split the CTE definitions (as found in the WITH clause) into individual definitions,
     taking care not to split on commas within nested parentheses.
@@ -255,7 +283,7 @@ def split_cte_definitions(cte_defs: str) -> list[str]:
     definitions = []
     current = []
     level = 0
-    for char in cte_defs:
+    for char in cte_definitions:
         if char == '(':
             level += 1
             current.append(char)
@@ -301,10 +329,10 @@ def extract_cte_definitions(query: str) -> tuple[str, str]:
             depth -= 1
         i += 1
     if main_query_start is None:
-        return ("".join(cte_part).strip(), "")
-    cte_defs_str = "".join(cte_part).strip()
+        return "".join(cte_part).strip(), ""
+    cte_definitions_str = "".join(cte_part).strip()
     main_query = remaining[main_query_start:].strip()
-    return (cte_defs_str, main_query)
+    return cte_definitions_str, main_query
 
 
 def transform_ctes_to_subqueries(query: str) -> str:
@@ -320,12 +348,12 @@ def transform_ctes_to_subqueries(query: str) -> str:
         return query
 
     # Extract the CTE definitions block and the main query using the custom parser.
-    cte_defs_str, main_query = extract_cte_definitions(query)
+    cte_definitions_str, main_query = extract_cte_definitions(query)
     if not main_query:
         return query
 
     # Split individual CTE definitions.
-    cte_def_list = split_cte_definitions(cte_defs_str)
+    cte_def_list = split_cte_definitions(cte_definitions_str)
     alias_to_subquery = {}
     # Extract the alias and subquery text from each definition.
     # Each definition is assumed to be of the form: alias AS ( subquery )
