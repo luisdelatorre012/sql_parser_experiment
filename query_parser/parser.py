@@ -220,6 +220,8 @@ def transform_subqueries_to_ctes(query: str) -> str:
     Raises:
         MultipleQueriesError: If more than one SQL statement is detected.
     """
+    query = sqlparse.format(query, strip_comments=True)
+
     statement = parse_single_query(query)
     if statement is None:
         return query
@@ -343,6 +345,9 @@ def transform_ctes_to_subqueries(query: str) -> str:
 
     It also removes any CROSS JOINs inserted for scalar subqueries.
     """
+
+    query = sqlparse.format(query, strip_comments=True)
+
     # Only process if the query starts with WITH.
     if not re.match(r"(?is)^\s*WITH\s+", query):
         return query

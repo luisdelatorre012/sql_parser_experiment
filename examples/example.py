@@ -11,11 +11,14 @@ def main():
     """
 
     query = """
+    /*hello*/
     WITH cte_0 AS (
         SELECT AVG(b) AS val FROM table2
     )
     SELECT a, b FROM table1 CROSS JOIN cte_0 WHERE a > cte_0.val   
     """
+
+    transform_subqueries_to_ctes(query)
     transformed_query = transform_ctes_to_subqueries(query)
 
     print("transformed query:")
