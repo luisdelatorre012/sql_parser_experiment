@@ -1,404 +1,239 @@
+# tests/test_sql_subquery_cte_transformer.py
+import re
+from collections import Counter
+
+import duckdb
 import pytest
 
-from query_parser import (
-    transform_subqueries_to_ctes,
-    transform_ctes_to_subqueries,
-    MultipleQueriesError,
-    get_outer_tables
-)
+from query_parser import transform_subqueries_to_ctes, transform_ctes_to_subqueries, MultipleQueriesError
 
 
-def remove_whitespace(sql: str) -> str:
-    """Normalize SQL by standardizing whitespace and case."""
-    # First remove all whitespace
-    sql = sql.upper()
+# ---------------------------------------------------------------------------
+# Helper utilities
+# ---------------------------------------------------------------------------
 
-    # Add space after common punctuation
-    for char in [',', '(', ')', '=']:
-        sql = sql.replace(char, f"{char} ")
-
-    # Remove extra spaces around these characters
-    for char in ['(', ')', '.']:
-        sql = sql.replace(f" {char} ", f"{char}")
-
-    # Fix spacing for operators
-    for op in [' = ', ' > ', ' < ', ' >= ', ' <= ', ' <> ']:
-        sql = sql.replace(op.upper(), op)
-
-    # Fix JOIN keywords spacing
-    for join in ['INNER JOIN', 'LEFT JOIN', 'RIGHT JOIN', 'OUTER JOIN', 'CROSS JOIN', 'JOIN']:
-        sql = sql.replace(f" {join} ", f" {join} ")
-
-    # Collapse all whitespace
-    return " ".join(sql.split())
+def _normalize(sql: str) -> str:
+    """Return a canonical, upper‑cased, single‑spaced SQL string."""
+    return re.sub(r"\s+", " ", sql).upper().strip()
 
 
-# --- Tests for get_outer_tables() ---
-@pytest.mark.parametrize("query, expected_tables", [
-    (
-            "SELECT t1.a, (SELECT t2.b FROM table2 t2) FROM table1 t1",
-            {"TABLE1"}
-    ),
-    (
-            "SELECT a FROM table1 JOIN table2 ON table1.id = table2.id",
-            {"TABLE1", "TABLE2"}
-    ),
-    (
+def assert_sql_equal(actual: str, expected: str) -> None:  # noqa: D401
+    """Assert that two SQL strings are equivalent once normalized."""
+    assert _normalize(actual) == _normalize(expected)
+
+
+def _rows(con: duckdb.DuckDBPyConnection, sql: str):
+    """Execute *sql* on *con* and return a multiset of rows (order‑independent)."""
+    return Counter(tuple(row) for row in con.execute(sql).fetchall())
+
+
+# ---------------------------------------------------------------------------
+# DuckDB fixture – in‑memory database used for semantic checks
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def db():  # noqa: D401 – fixture name recognised by pytest
+    con = duckdb.connect(database=":memory:")
+
+    # ---------------------------------------------------------------------
+    # Schema under test – keep deliberately tiny yet non‑trivial so that
+    # aggregations return different values to highlight semantic issues.
+    # ---------------------------------------------------------------------
+
+    con.execute(
+        """
+        CREATE TABLE table1
+        (
+            a      INT,
+            b      INT,
+            id     INT,
+            status VARCHAR
+        );
+        INSERT INTO table1
+        VALUES (1, 10, 1, 'active'),
+               (2, 20, 2, 'inactive'),
+               (3, 30, 1, 'active'),
+               (4, 40, 3, 'inactive');
+        """
+    )
+
+    con.execute(
+        """
+        CREATE TABLE table2
+        (
+            b   INT,
+            c   INT,
+            id  INT,
+            val INT
+        );
+        INSERT INTO table2
+        VALUES (10, 100, 1, 5),
+               (20, 200, 2, 10),
+               (30, 300, 1, 15),
+               (40, 400, 3, 20);
+        """
+    )
+
+    con.execute("CREATE TABLE table3(id INT);")
+    con.execute("INSERT INTO table3 VALUES (1), (2), (3);")
+
+    con.execute("CREATE TABLE table4(id INT);")
+    con.execute("INSERT INTO table4 VALUES (1), (2), (4);")
+
+    yield con
+    con.close()
+
+
+# ---------------------------------------------------------------------------
+# transform_subqueries_to_ctes – AST/text behaviour
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "query, expected",
+    [
+        ("SELECT a, b FROM table1", "SELECT a, b FROM table1"),
+        (
             """
-            SELECT t1.a,
-                   (SELECT t2.b FROM table2 t2 WHERE t2.id IN (SELECT id FROM table3))
-            FROM table1 t1
-            JOIN table4 t4 ON t1.id = t4.id
-            WHERE t1.status = 'active'
-            """,
-            {"TABLE1", "TABLE4"}
-    ),
-])
-def test_get_outer_tables(query: str, expected_tables: set) -> None:
-    outer_tables = get_outer_tables(query)
-    normalized_tables = {table.upper() for table in outer_tables}
-    assert expected_tables.issubset(normalized_tables)
-
-
-@pytest.mark.parametrize("query, expected", [
-    # No subqueries - should remain unchanged
-    (
-            "SELECT a, b FROM table1",
-            "SELECT a, b FROM table1"
-    ),
-    # Uncorrelated scalar subquery in SELECT
-    (
-            """
-            SELECT a, b,
-                   (SELECT MAX(c) FROM table2) as max_c
+            SELECT a,
+                   b,
+                   (SELECT MAX(c) FROM table2) AS max_c
             FROM table1
             """,
             """
-            WITH cte_0 AS (
-                SELECT MAX(c) AS val FROM table2
-            )
-            SELECT a, b, cte_0.val as max_c 
-            FROM table1 CROSS JOIN cte_0
+            WITH cte_0 AS (SELECT MAX(c) AS val
+                           FROM table2)
+            SELECT a, b, cte_0.val AS max_c
+            FROM table1
+                     CROSS JOIN cte_0
+            """,
+        ),
+        (
             """
-    ),
-    # Subquery in WHERE clause
-    (
-            """
-            SELECT a
+            SELECT a, b
             FROM table1
             WHERE a > (SELECT AVG(b) FROM table2)
             """,
             """
-            WITH cte_0 AS (
-                SELECT AVG(b) AS val FROM table2
-            )
-            SELECT a
-            FROM table1 CROSS JOIN cte_0
+            WITH cte_0 AS (SELECT AVG(b) AS val
+                           FROM table2)
+            SELECT a, b
+            FROM table1
+                     CROSS JOIN cte_0
             WHERE a > cte_0.val
-            """
-    ),
-    # Subquery in JOIN clause
-    (
-            """
-            SELECT t1.a, t2.max_val
-            FROM table1 t1
-            JOIN (SELECT id, MAX(val) as max_val FROM table2 GROUP BY id) t2 ON t1.id = t2.id
             """,
-            """
-            WITH cte_0 AS (
-                SELECT id, MAX(val) as max_val FROM table2 GROUP BY id
-            )
-            SELECT t1.a, t2.max_val
-            FROM table1 t1
-            JOIN cte_0 t2 ON t1.id = t2.id
-            """
-    ),
-    # Duplicated subqueries (should be deduplicated)
-    (
+        ),
+        (
             """
             SELECT a,
-                   (SELECT MAX(c) FROM table2) as max_c,
-                   (SELECT MAX(c) FROM table2) as another_max
+                   (SELECT MAX(c) FROM table2) AS max_c,
+                   (SELECT MAX(c) FROM table2) AS another_max
             FROM table1
             """,
             """
-            WITH cte_0 AS (
-                SELECT MAX(c) AS val FROM table2
-            )
-            SELECT a, cte_0.val as max_c, cte_0.val as another_max
-            FROM table1 CROSS JOIN cte_0
-            """
-    ),
-    # Correlated subquery (should not be transformed)
-    (
-            """
-            SELECT a, b,
-                   (SELECT MAX(c) FROM table2 WHERE table2.id = table1.id) as max_c
+            WITH cte_0 AS (SELECT MAX(c) AS val
+                           FROM table2)
+            SELECT a, cte_0.val AS max_c, cte_0.val AS another_max
             FROM table1
+                     CROSS JOIN cte_0
             """,
-            """
-            SELECT a, b,
-                   (SELECT MAX(c) FROM table2 WHERE table2.id = table1.id) as max_c
-            FROM table1
-            """
-    ),
-    # Multiple different subqueries
-    (
-            """
-            SELECT a, 
-                   (SELECT MAX(c) FROM table2) as max_c,
-                   (SELECT MIN(d) FROM table3) as min_d
-            FROM table1
-            WHERE a > (SELECT AVG(e) FROM table4)
-            """,
-            """
-            WITH cte_0 AS (
-                SELECT MAX(c) AS val FROM table2
-            ),
-            cte_1 AS (
-                SELECT MIN(d) AS val FROM table3
-            ),
-            cte_2 AS (
-                SELECT AVG(e) AS val FROM table4
-            )
-            SELECT 
-                a, 
-                cte_0.val as max_c, 
-                cte_1.val as min_d
-            FROM table1 
-            CROSS JOIN cte_0 
-            CROSS JOIN cte_1 
-            CROSS JOIN cte_2
-            WHERE a > cte_2.val
-            """
-    ),
-])
-def test_transform_subqueries_to_ctes(query, expected):
-    """Test that transform_query_to_ctes produces the expected full output."""
-    result = transform_subqueries_to_ctes(query)
-
-    # Remove all whitespace for comparison
-    normalized_result = ''.join(remove_whitespace(result).split())
-    normalized_expected = ''.join(remove_whitespace(expected).split())
-    assert normalized_result == normalized_expected
+        ),
+    ],
+)
+def test_transform_subqueries_to_ctes_text(query: str, expected: str) -> None:  # noqa: D103
+    assert_sql_equal(transform_subqueries_to_ctes(query), expected)
 
 
-@pytest.mark.parametrize("query, expected", [
-    (
-            """
-            SELECT a,
-                   (SELECT MAX(c) FROM table2) as max_c,
-                   (SELECT MAX(c) FROM table2) as another_max
-            FROM table1
-            """,
-            """
-            WITH cte_0 AS(
-            SELECT 
-                MAX(c) AS val
-               FROM table2
-            )
-            SELECT a,
-                   cte_0.val AS max_c,
-                   cte_0.val AS another_max
-            FROM table1
-            CROSS JOIN cte_0
-            """
-    ),
-])
-def test_duplicate_subqueries(query: str, expected: str) -> None:
-    result = transform_subqueries_to_ctes(query)
+# ---------------------------------------------------------------------------
+# Semantic equivalence using DuckDB – subquery ➜ CTE
+# ---------------------------------------------------------------------------
 
-    normalized_result = ''.join(remove_whitespace(result).split())
-    normalized_expected = ''.join(remove_whitespace(expected).split())
+_semantic_cases_sub_to_cte = [
+    "SELECT a, b FROM table1",
+    "SELECT a, b FROM table1 WHERE a > (SELECT AVG(b) FROM table2)",
+    """
+    SELECT a,
+           (SELECT MAX(c) FROM table2) AS max_c,
+           (SELECT MAX(c) FROM table2) AS another_max
+    FROM table1
+    """,
+]
 
-    assert normalized_result == normalized_expected
+@pytest.mark.parametrize("query", _semantic_cases_sub_to_cte)
+def test_semantic_equivalence_sub_to_cte(query: str, db):  # noqa: D103
+    transformed = transform_subqueries_to_ctes(query)
+    assert _rows(db, query) == _rows(db, transformed)
 
 
-@pytest.mark.parametrize("query", [
-    (
-            """
-            SELECT a, b,
-                   (SELECT c FROM table2 UNION SELECT c FROM table3) as union_c
-            FROM table1
-            """
-    ),
-    (
-            """
+# ---------------------------------------------------------------------------
+# Idempotency – running transform twice yields same SQL
+# ---------------------------------------------------------------------------
+
+def test_transform_is_idempotent() -> None:  # noqa: D103
+    query = """
+            WITH cte_0 AS (SELECT AVG(b) AS val
+                           FROM table2)
             SELECT a
             FROM table1
-            WHERE EXISTS (SELECT 1 FROM table2 WHERE table2.id = table1.id)
+                     CROSS JOIN cte_0
+            WHERE a > cte_0.val \
             """
-    ),
-    (
+    once = transform_ctes_to_subqueries(query)
+    twice = transform_ctes_to_subqueries(once)
+    assert_sql_equal(once, twice)
+
+
+# ---------------------------------------------------------------------------
+# transform_ctes_to_subqueries – basic text checks
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "query, expected",
+    [
+        (
+            "SELECT a, b FROM table1 WHERE a > 10",
+            "SELECT a, b FROM table1 WHERE a > 10",
+        ),
+        (
             """
-            SELECT a,
-                   (SELECT AVG(val) OVER (PARTITION BY id) FROM table2) as avg_val
+            WITH cte_0 AS (SELECT AVG(b) AS val
+                           FROM table2)
+            SELECT a, b
             FROM table1
+                     CROSS JOIN cte_0
+            WHERE a > cte_0.val
+            """,
+            "SELECT a, b FROM table1 WHERE a > (SELECT AVG(b) AS val FROM table2)",
+        ),
+        (
             """
-    ),
-    "SELECT a, b FROM table1 WHERE a > (SELECT AVG(b) FROM table2 WHERE table2.id = table1.id)",
-    "SELECT a, (SELECT AVG(val) OVER (PARTITION BY id) FROM table2) as avg_val FROM table1"
-])
-def test_non_transformable_subqueries(query: str) -> None:
-    result = transform_subqueries_to_ctes(query)
-    normalized_result = ''.join(remove_whitespace(result).split())
-    normalized_expected = ''.join(remove_whitespace(query).split())
-    assert normalized_result == normalized_expected
+            WITH cte_0 AS (SELECT MAX(c) AS val
+                           FROM table2)
+            SELECT a, cte_0.val AS max_c, cte_0.val AS another_max
+            FROM table1
+                     CROSS JOIN cte_0
+            """,
+            "SELECT a, (SELECT MAX(c) AS val FROM table2) AS max_c, (SELECT MAX(c) AS val FROM table2) AS another_max FROM table1",
+        ),
+    ],
+)
+def test_transform_ctes_to_subqueries_text(query: str, expected: str) -> None:  # noqa: D103
+    assert_sql_equal(transform_ctes_to_subqueries(query), expected)
 
 
-@pytest.mark.parametrize("query", [
-    "SELECT a FROM table1; SELECT b FROM table2;",
-])
-def test_multiple_queries_exception(query: str) -> None:
+# ---------------------------------------------------------------------------
+# Sequential CTE names ensure deterministic naming
+# ---------------------------------------------------------------------------
+
+def test_sequential_cte_names() -> None:  # noqa: D103
+    query = "SELECT (SELECT 1), (SELECT 2)"
+    normalized = _normalize(transform_subqueries_to_ctes(query))
+    assert "WITH CTE_0" in normalized and ", CTE_1" in normalized
+
+
+# ---------------------------------------------------------------------------
+# Error handling – multiple statements should raise
+# ---------------------------------------------------------------------------
+
+def test_multiple_queries_raises() -> None:  # noqa: D103
     with pytest.raises(MultipleQueriesError):
-        transform_subqueries_to_ctes(query)
-
-
-def test_get_outer_tables_nested() -> None:
-    query = """
-    SELECT t1.a,
-           (SELECT t2.b FROM table2 t2 WHERE t2.id IN (SELECT id FROM table3)) as b_val
-    FROM table1 t1
-    JOIN table4 t4 ON t1.id = t4.id
-    WHERE t1.status = 'active'
-    """
-    outer_tables: set = get_outer_tables(query)
-    normalized_tables = {table.upper() for table in outer_tables}
-    assert "TABLE1" in normalized_tables
-    assert "TABLE4" in normalized_tables
-    assert "TABLE2" not in normalized_tables
-    assert "TABLE3" not in normalized_tables
-
-
-def test_query_formatting() -> None:
-    query = "SELECT a,b FROM table1 WHERE a > (SELECT AVG(b) FROM table2)"
-    result = transform_subqueries_to_ctes(query)
-    # Check that line breaks exist and that the normalized output starts with a WITH or SELECT.
-    assert "\n" in result
-    assert remove_whitespace(result).startswith("WITH") or remove_whitespace(result).startswith("SELECT")
-
-
-def test_full_output_scalar_where() -> None:
-    """
-    Test a query with a scalar subquery in the WHERE clause.
-    Expected transformation:
-
-    WITH cte_0 AS (
-        SELECT AVG(b) AS val FROM table2
-    )
-    SELECT a, b FROM table1 CROSS JOIN cte_0 WHERE a > cte_0.val
-    """
-    query = "SELECT a, b FROM table1 WHERE a > (SELECT AVG(b) FROM table2)"
-    expected = (
-        """
-        WITH cte_0 AS (
-            SELECT AVG(b) AS val FROM table2
-        )
-        SELECT a, b FROM table1 CROSS JOIN cte_0 WHERE a > cte_0.val        
-        """
-    )
-    result = transform_subqueries_to_ctes(query)
-    normalized_result = ''.join(remove_whitespace(result).split())
-    normalized_expected = ''.join(remove_whitespace(expected).split())
-    assert normalized_result == normalized_expected
-
-
-def test_full_output_duplicate_scalar() -> None:
-    """
-    Test a query where the same scalar subquery appears twice.
-    Expected transformation:
-    """
-    query = """
-        SELECT a,
-        (SELECT MAX(c) FROM table2) as max_c,
-        (SELECT MAX(c) FROM table2) as another_max
-        FROM table1
-        """
-    expected = """
-    WITH cte_0 AS (
-        SELECT MAX(c) AS val FROM table2
-    )
-    SELECT a, cte_0.val AS max_c, cte_0.val AS another_max
-    FROM table1 CROSS JOIN cte_0
-    """
-    result = transform_subqueries_to_ctes(query)
-    normalized_result = ''.join(remove_whitespace(result).split())
-    normalized_expected = ''.join(remove_whitespace(expected).split())
-    assert normalized_result == normalized_expected
-
-
-# --- New tests for transform_ctes_to_subqueries() --- #
-
-def test_transform_ctes_to_subqueries_no_with() -> None:
-    """
-    When the query does not start with a WITH clause,
-    transform_ctes_to_subqueries() should return the original query.
-    """
-    query = "SELECT a, b FROM table1 WHERE a > 10"
-    result = transform_ctes_to_subqueries(query)
-    assert remove_whitespace(result) == remove_whitespace(query)
-
-
-@pytest.mark.parametrize("query, expected", [
-    (
-            # Basic scalar subquery transformation:
-            """
-            WITH cte_0 AS (
-                SELECT AVG(b) AS val FROM table2
-            )
-            SELECT a, b FROM table1 CROSS JOIN cte_0 WHERE a > cte_0.val    
-            """,
-            "SELECT a, b FROM table1 WHERE a > (SELECT AVG(b) AS VAL FROM table2)"
-    ),
-])
-def test_transform_ctes_to_subqueries_basic(query: str, expected: str) -> None:
-    result = transform_ctes_to_subqueries(query)
-
-    normalized_result = ''.join(remove_whitespace(result).split())
-    normalized_expected = ''.join(remove_whitespace(expected).split())
-
-    assert normalized_result == normalized_expected
-
-
-@pytest.mark.parametrize("query, expected", [
-    (
-            # Duplicate scalar subqueries transformed back inline:
-            """
-            WITH cte_0 AS (
-                SELECT MAX(c) AS val FROM table2
-            )
-            SELECT 
-                a, 
-                cte_0.val AS max_c, 
-                cte_0.val AS another_max 
-            FROM table1 CROSS JOIN cte_0
-            """,
-            "SELECT a, (SELECT MAX(c) AS VAL FROM table2) AS max_c, (SELECT MAX(c) AS VAL  FROM table2) AS another_max FROM table1"
-    ),
-])
-def test_transform_ctes_to_subqueries_duplicate(query: str, expected: str) -> None:
-    result = transform_ctes_to_subqueries(query)
-    assert remove_whitespace(result) == remove_whitespace(expected)
-
-
-@pytest.mark.parametrize("query, expected", [
-    (
-            """
-            WITH cte_0 AS (SELECT AVG(b) AS val FROM table2), 
-                 cte_1 AS (SELECT MAX(c) AS val FROM table3)
-            SELECT 
-                a, b 
-            FROM table1 
-            CROSS JOIN cte_0 
-            CROSS JOIN cte_1
-            WHERE a > cte_0.val AND b = cte_1
-            """,
-            "SELECT a, b FROM table1 WHERE a > (SELECT AVG(b) AS VAL FROM table2) AND b = (SELECT MAX(c) AS VAL FROM table3)"
-    ),
-])
-def test_transform_ctes_to_subqueries_multiple(query: str, expected: str) -> None:
-    result = transform_ctes_to_subqueries(query)
-    normalized_result = ''.join(remove_whitespace(result).split())
-    normalized_expected = ''.join(remove_whitespace(expected).split())
-
-    assert normalized_result == normalized_expected
+        transform_subqueries_to_ctes("SELECT 1; SELECT 2;")

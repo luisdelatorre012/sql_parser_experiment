@@ -1,405 +1,313 @@
-import sqlglot
-import sqlparse
-from sqlglot.expressions import AggFunc
-from sqlparse.sql import Parenthesis, Token
-from sqlparse.tokens import DML
+"""
+sql_subquery_cte_transformer
+============================
+
+Bidirectional transformation between inline sub‑queries and
+Common Table Expressions (CTEs).
+
+Public API
+----------
+transform_subqueries_to_ctes(sql: str, *, dialect: str | None = None) -> str
+transform_ctes_to_subqueries(sql: str, *, dialect: str | None = None) -> str
+MultipleQueriesError
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass, field
 import re
+from typing import Dict, List, Set
+
+import sqlparse
+import sqlglot
+from sqlglot import exp
+from sqlglot.expressions import alias_
 
 
-# TODO: what other parts of this can I replace with sqlglot?
-# TODO: add the sqlglot class from the other project. where should I put it in the directory structure?
+# ---------------------------------------------------------------------------#
+# Public exceptions
+# ---------------------------------------------------------------------------#
 
 
 class MultipleQueriesError(Exception):
-    """Raised when multiple SQL queries are detected."""
-    pass
+    """Raised when more than one top‑level SQL statement is supplied."""
 
 
-def remove_parenthesized_content(query: str) -> str:
-    result = []
-    level: int = 0
-    for char in query:
-        if char == '(':
-            level += 1
-        elif char == ')':
-            if level > 0:
-                level -= 1
-        else:
-            if level == 0:
-                result.append(char)
-    return ''.join(result)
+# ---------------------------------------------------------------------------#
+# Regexes – pre‑compiled for speed
+# ---------------------------------------------------------------------------#
+
+RE_SET_OP = re.compile(r"\b(?:UNION|INTERSECT|EXCEPT)\b", re.I)
+RE_EXISTS = re.compile(r"\b(?:NOT\s+)?EXISTS\b", re.I)
+RE_WINDOW = re.compile(r"\bOVER\s*\(", re.I)
+RE_FROM_OR_JOIN = re.compile(r"\b(?:FROM|JOIN)\s+([^\s,;()]+)", re.I)
+RE_ALIAS = re.compile(r"\bAS\s+([A-Z_][A-Z0-9_$]*)", re.I)
+
+# ---------------------------------------------------------------------------#
+# Helper dataclasses
+# ---------------------------------------------------------------------------#
 
 
-def get_outer_tables(query: str) -> set[str]:
-    query_without_subqueries = remove_parenthesized_content(query)
-    pattern = r'\b(?:FROM|JOIN)\s+([^\s,;]+)'
-    tables = re.findall(pattern, query_without_subqueries, flags=re.IGNORECASE)
-    return set(tables)
+from sqlglot import exp
 
 
-def find_subqueries(token_list: list[Token]) -> list[Token]:
-    subqueries = []
-    for token in token_list:
-        if isinstance(token, Parenthesis):
-            if any(t.ttype is DML and t.value.upper() == 'SELECT' for t in token.tokens):
-                subqueries.append(token)
-        elif token.is_group:
-            subqueries.extend(find_subqueries(token.tokens))
-    return subqueries
+def _tables_in_from(from_clause: exp.From) -> set[str]:
+    """
+    Return table names that are direct FROM or JOIN sources.
+    Ignores tables referenced only in projections or nested sub‑queries.
+    """
+    names: set[str] = set()
+
+    # Main source after FROM
+    if isinstance(from_clause.this, exp.Table):
+        names.add(from_clause.this.name)
+
+    # Each JOIN X ...
+    for join in from_clause.args.get("joins", []):
+        if isinstance(join.this, exp.Table):
+            names.add(join.this.name)
+
+    return names
 
 
-def is_correlated_subquery(subquery_str: str, outer_query: str) -> bool:
-    outer_tables = get_outer_tables(outer_query)
-    for table in outer_tables:
-        if table in subquery_str:
+@dataclass
+class _TransformState:
+    """Keeps all mutable state during a single transformation."""
+
+    counter: int = 0
+    mapping: Dict[str, str] = field(default_factory=dict)  # norm_sql -> alias
+    cte_definitions: List[str] = field(default_factory=list)
+    scalar_aliases: Set[str] = field(default_factory=set)
+    used_names: Set[str] = field(default_factory=set)
+
+    def next_alias(self) -> str:
+        """Return the next `cte_n` name that doesn't clash with existing names."""
+        while True:
+            alias = f"cte_{self.counter}"
+            self.counter += 1
+            if alias.upper() not in self.used_names:
+                self.used_names.add(alias.upper())
+                return alias
+
+
+# ---------------------------------------------------------------------------#
+# Utility helpers
+# ---------------------------------------------------------------------------#
+
+
+def _normalize_sql(sql: str) -> str:
+    """Collapse whitespace and upper‑case for dictionary keys."""
+    return re.sub(r"\s+", " ", sql).strip().upper()
+
+
+def _outer_table_aliases(sql: str) -> Set[str]:
+    """
+    Collect table names or aliases that appear in FROM / JOIN clauses.
+    Used only to avoid alias collisions.
+    """
+    names = set(m.group(1).upper() for m in RE_FROM_OR_JOIN.finditer(sql))
+    names.update(m.group(1).upper() for m in RE_ALIAS.finditer(sql))
+    return names
+
+
+def _is_scalar_query(select_expr: exp.Select) -> bool:
+    """
+    Return True if the SELECT is judged to be scalar (one row, one column).
+    Heuristics are enough for this transformer.
+    """
+    # Aggregate without GROUP BY
+    if select_expr.args.get("group") is None:
+        if any(isinstance(node, exp.AggFunc) for node in select_expr.find_all(exp.AggFunc)):
             return True
+
+    # Single constant projection
+    items = select_expr.expressions
+    if len(items) == 1 and isinstance(items[0], (exp.Literal, exp.Anonymous)):
+        return True
+
     return False
 
 
-def is_transformable_subquery(inner_subquery: str, outer_query: str) -> bool:
-    if is_correlated_subquery(inner_subquery, outer_query):
-        return False
-    if re.search(r'\b(UNION|INTERSECT|EXCEPT)\b', inner_subquery, flags=re.IGNORECASE):
-        return False
-    if re.search(r'\b(EXISTS|NOT\s+EXISTS)\b', inner_subquery, flags=re.IGNORECASE):
-        return False
-    if re.search(r'\bOVER\s*\(', inner_subquery, flags=re.IGNORECASE):
-        return False
-    return True
-
-
-def parse_single_query(query: str):
-    """Parse the query and ensure only a single SQL statement is present."""
-    parsed = sqlparse.parse(query)
-    if not parsed:
-        return None
-    if len(parsed) != 1:
-        raise MultipleQueriesError("Multiple queries found; only a single query is supported.")
-    return parsed[0]
-
-
-def extract_inner_subquery(subquery_text: str) -> str:
+def _make_cte_sql(inner_sql: str, alias: str, *, dialect: str | None) -> str:
     """
-    Given the text of a subquery, strip the outer parentheses if they exist.
+    Build `alias AS ( … )`.  If the sub‑query is scalar, force its projection
+    to have a column named `val`.
     """
-    if subquery_text.startswith('(') and subquery_text.endswith(')'):
-        return subquery_text[1:-1].strip()
-    return subquery_text
+    parsed = sqlglot.parse_one(inner_sql, read=dialect)
+
+    if isinstance(parsed, exp.Select) and _is_scalar_query(parsed):
+        proj = parsed.expressions[0]
+        if not proj.alias_or_name:
+            parsed.set("expressions", [alias_(proj.copy(), "val")])
+
+    return f"{alias} AS ({parsed.sql(dialect=dialect).rstrip(';')})"
 
 
-def normalize_subquery(subquery: str) -> str:
-    """Normalize the subquery string by collapsing all whitespace to a single space."""
-    return " ".join(subquery.split())
+# ---------------------------------------------------------------------------#
+# 1) sub‑query  ->  CTE
+# ---------------------------------------------------------------------------#
 
 
-def is_scalar_subquery(subquery: str) -> bool:
+def transform_subqueries_to_ctes(sql: str, *, dialect: str | None = None) -> str:
     """
-    Determine if a subquery is scalar by checking for aggregate functions
-    or if it's structured to return a single value.
-
-    Uses sqlglot to parse the SQL and detect aggregate functions properly.
+    Replace uncorrelated sub‑queries with de‑duplicated CTEs.
+    Scalar sub‑queries get a `val` column and a `CROSS JOIN cte_n`.
     """
+    # -- 1. Strip comments and ensure single statement --------------------
+    statements = sqlparse.parse(sql)
+    if len(statements) != 1:
+        raise MultipleQueriesError("Exactly one SQL statement is required.")
+    raw = sqlparse.format(sql, strip_comments=True).strip()
 
-    # Parse the SQL subquery
-    parsed = sqlglot.parse_one(subquery)
+    state = _TransformState()
+    state.used_names.update(_outer_table_aliases(raw))
 
-    # Function to recursively check for aggregate functions in the AST
-    def has_aggregate(node):
-        if isinstance(node, AggFunc):
-            return True
+    # -- 2. Find sub‑queries with sqlparse (unchanged) --------------------
+    parsed_stmt = statements[0]
+    subqueries: list[sqlparse.sql.Parenthesis] = []
 
-        # Check children nodes
-        if hasattr(node, 'args'):
-            for arg in node.args.values():
-                if isinstance(arg, list):
-                    for item in arg:
-                        if has_aggregate(item):
-                            return True
-                elif arg is not None:
-                    if has_aggregate(arg):
-                        return True
-        return False
+    def _gather(tokens: list[sqlparse.sql.Token]) -> None:
+        for tok in tokens:
+            if isinstance(tok, sqlparse.sql.Parenthesis):
+                if any(t.ttype is sqlparse.tokens.DML and t.value.upper() == "SELECT" for t in tok.tokens):
+                    subqueries.append(tok)
+            if tok.is_group:
+                _gather(list(tok.tokens))
 
-    # Check if the query contains any aggregate functions
-    return has_aggregate(parsed)
+    _gather(list(parsed_stmt.tokens))
 
+    transformed_sql = raw
 
-def create_cte_definition(inner_subquery: str, alias: str) -> str:
-    """
-    Create the CTE definition string. If the subquery is scalar, modify the SELECT clause
-    to include an alias "val" so that the outer query can reference it as {alias}.val.
-    If an aggregate function already has an alias, that alias is preserved.
-    """
-    if is_scalar_subquery(inner_subquery):
-        # Check if there's already an alias in the SELECT clause
-        select_pattern = r'SELECT\s+(.*?)(?:\s+FROM\s+|$)'
-        select_match = re.search(select_pattern, inner_subquery, flags=re.IGNORECASE | re.DOTALL)
-
-        if select_match and not re.search(r'\bAS\s+\w+', select_match.group(1), flags=re.IGNORECASE):
-            # No alias found, add "AS val" before FROM clause
-            new_inner_subquery = re.sub(
-                r'(SELECT\s+.*?)(\s+FROM\s+)',
-                r'\1 AS val\2',
-                inner_subquery,
-                flags=re.IGNORECASE | re.DOTALL
-            )
-            return f"{alias} AS ({new_inner_subquery})"
-
-        # Alias already exists, use the subquery as is
-        return f"{alias} AS ({inner_subquery})"
-    else:
-        return f"{alias} AS ({inner_subquery})"
-
-
-def update_main_query_for_scalar_subqueries(main_query: str, uncorrelated_subqueries: dict[str, str]) -> str:
-    """
-    For each scalar subquery, update the main query:
-      - Replace unqualified references to the alias with a qualified version (alias.val).
-      - Insert a CROSS JOIN with the corresponding CTE for scalar subqueries not already in JOIN.
-    """
-    # First, replace all scalar references with qualified versions
-    for normalized, alias in uncorrelated_subqueries.items():
-        if re.search(r'\b(AVG|SUM|COUNT|MIN|MAX)\(', normalized, flags=re.IGNORECASE):
-            # Don't modify aliases that appear in JOIN clauses
-            join_pattern = rf'(?i)JOIN\s+{alias}\b\s+(?:AS\s+)?(\w+)'
-            join_matches = re.finditer(join_pattern, main_query)
-
-            # Store the positions of JOIN aliases to avoid modifying them
-            join_positions = []
-            for match in join_matches:
-                start, end = match.span(0)
-                join_positions.append((start, end))
-
-            # Replace alias references with qualified ones (i.e. alias.val)
-            # but only for references not in JOIN clauses
-            pattern = rf'(?<!\.)\b{alias}\b'
-            positions = []
-            for match in re.finditer(pattern, main_query):
-                start, end = match.span(0)
-                # Check if this match is within a JOIN clause
-                in_join = any(pos[0] <= start <= pos[1] for pos in join_positions)
-                if not in_join:
-                    positions.append((start, end))
-
-            # Replace from end to start to avoid position shifts
-            positions.sort(reverse=True)
-            for start, end in positions:
-                before = main_query[:start]
-                after = main_query[end:]
-                main_query = before + f"{alias}.val" + after
-
-    # Now collect all CTEs that need cross joins
-    ctes_to_join = []
-    for normalized, alias in uncorrelated_subqueries.items():
-        if re.search(r'\b(AVG|SUM|COUNT|MIN|MAX)\(', normalized, flags=re.IGNORECASE):
-            # Only add CROSS JOIN if the CTE is not already part of a JOIN
-            if not re.search(rf'(?i)JOIN\s+{alias}\b', main_query):
-                ctes_to_join.append(alias)
-
-    # Add all cross joins in proper order (matching CTE declaration order)
-    if ctes_to_join:
-        from_pattern = r'(FROM\s+\S+)'
-        from_match = re.search(from_pattern, main_query)
-        if from_match:
-            join_clause = " " + " ".join(f"CROSS JOIN {alias}" for alias in ctes_to_join)
-            before = main_query[:from_match.end()]
-            after = main_query[from_match.end():]
-            main_query = before + join_clause + after
-
-    return main_query
-
-
-def transform_subqueries_to_ctes(query: str) -> str:
-    """
-    Transform the given SQL query by extracting uncorrelated and transformable subqueries
-    and replacing them with CTE references. For scalar subqueries (detected heuristically via
-    aggregate functions), the CTE definition is modified so that the SELECT clause includes a
-    column alias 'val'. The outer query gets a CROSS JOIN with the CTE and uses the qualified
-    reference (e.g. cte_0.val) in predicate contexts.
-
-    Raises:
-        MultipleQueriesError: If more than one SQL statement is detected.
-    """
-    query = sqlparse.format(query, strip_comments=True)
-
-    statement = parse_single_query(query)
-    if statement is None:
-        return query
-
-    # Assume find_subqueries is defined elsewhere.
-    subqueries = find_subqueries(statement.tokens)
-
-    cte_definitions = []
-    transformed_query = query
-    uncorrelated_subqueries: dict[str, str] = {}
-    alias_counter = 0
-
-    # Process each subquery to see if it should be transformed into a CTE.
-    for subquery in subqueries:
-        subquery_text = str(subquery).strip()
-        inner_subquery = extract_inner_subquery(subquery_text)
-        normalized = normalize_subquery(inner_subquery)
-
-        if not is_transformable_subquery(inner_subquery, query):
+    # -- 3. Replace sub‑queries with aliases, build CTEs  -----------------
+    for sub in subqueries:
+        inner_sql = str(sub)[1:-1].strip()  # drop outer parens
+        if (RE_SET_OP.search(inner_sql)
+                or RE_EXISTS.search(inner_sql)
+                or RE_WINDOW.search(inner_sql)
+                or any(tbl in inner_sql for tbl in state.used_names)):
             continue
 
-        if normalized in uncorrelated_subqueries:
-            alias = uncorrelated_subqueries[normalized]
+        norm_sql = _normalize_sql(inner_sql)
+        alias = state.mapping.get(norm_sql)
+        if alias is None:
+            alias = state.next_alias()
+            state.mapping[norm_sql] = alias
+            cte_sql = _make_cte_sql(inner_sql, alias, dialect=dialect)
+            state.cte_definitions.append(cte_sql)
+
+            select_ast = sqlglot.parse_one(inner_sql, read=dialect)
+            if isinstance(select_ast, exp.Select) and _is_scalar_query(select_ast):
+                state.scalar_aliases.add(alias)
+
+        transformed_sql = transformed_sql.replace(str(sub), alias, 1)
+
+    # -- 4. Qualify scalar aliases  ---------------------------------------
+    for alias in state.scalar_aliases:
+        transformed_sql = re.sub(rf"(?<!\.)\b{alias}\b", f"{alias}.val", transformed_sql)
+
+    # -- 5. Insert CROSS JOINs using the AST  -----------------------------
+    if state.scalar_aliases:
+        select_ast = sqlglot.parse_one(transformed_sql, read=dialect)
+
+        # -----------------------------------------------------------------
+        # (a) Guarantee a FROM clause exists
+        # -----------------------------------------------------------------
+        from_clause: exp.From | None = select_ast.args.get("from")
+
+        if from_clause is None:
+            # Pick the first scalar alias as the base row‑source
+            first_alias, *rest_aliases = list(state.scalar_aliases)
+            from_clause = exp.From(this=exp.Table(this=first_alias))
+            select_ast.set("from", from_clause)
+            pending_aliases = set(rest_aliases)
+            existing_tables = {first_alias}
         else:
-            alias = f"cte_{alias_counter}"
-            alias_counter += 1
-            uncorrelated_subqueries[normalized] = alias
-            cte_definition = create_cte_definition(inner_subquery, alias)
-            cte_definitions.append(cte_definition)
+            # FROM already present: collect its table and those in top‑level JOINs
+            existing_tables = set()
+            if isinstance(from_clause.this, exp.Table):
+                existing_tables.add(from_clause.this.name)
 
-        # Check if this subquery is part of a JOIN clause
-        join_pattern = rf'(?i)JOIN\s+{re.escape(subquery_text)}\s+(?:AS\s+)?(\w+)'
-        join_match = re.search(join_pattern, transformed_query)
+            for j in select_ast.args.get("joins", []):
+                if isinstance(j.this, exp.Table):
+                    existing_tables.add(j.this.name)
 
-        if join_match:
-            # If subquery is used in JOIN, preserve the original join semantics
-            table_alias = join_match.group(1)
-            # Replace just the subquery part, preserving the JOIN and any alias
-            transformed_query = transformed_query.replace(subquery_text, alias)
-        else:
-            # For other contexts (WHERE, SELECT, etc.), replace the subquery directly
-            transformed_query = transformed_query.replace(subquery_text, alias)
+            pending_aliases = state.scalar_aliases - existing_tables
 
-    # If any CTEs were created, build the WITH clause and update scalar subquery references.
-    if cte_definitions:
-        with_clause = "WITH " + ",\n     ".join(cte_definitions)
-        main_query = update_main_query_for_scalar_subqueries(transformed_query, uncorrelated_subqueries)
-        final_query = with_clause + "\n" + main_query
-    else:
-        final_query = transformed_query
+        # -----------------------------------------------------------------
+        # (b) Append CROSS JOINs for any still‑missing scalar CTEs
+        # -----------------------------------------------------------------
+        for alias in pending_aliases:
+            select_ast.append(
+                "joins",
+                exp.Join(this=exp.Table(this=alias), kind="cross"),
+            )
 
-    formatted_query = sqlparse.format(final_query, reindent=True, keyword_case='upper')
-    return formatted_query
+        # -----------------------------------------------------------------
+        transformed_sql = select_ast.sql(dialect=dialect)
+
+    # -- 6. Prepend WITH‑clause if any CTEs were created ------------------
+    if state.cte_definitions:
+        with_clause = "WITH " + ",\n     ".join(state.cte_definitions)
+        transformed_sql = f"{with_clause}\n{transformed_sql}"
+
+    # -- 7. Pretty‑print and return --------------------------------------
+    return sqlparse.format(transformed_sql, reindent=True, keyword_case="upper")
 
 
-def split_cte_definitions(cte_definitions: str) -> list[str]:
+# ---------------------------------------------------------------------------#
+# 2) CTE  ->  sub‑query
+# ---------------------------------------------------------------------------#
+
+
+def transform_ctes_to_subqueries(sql: str, *, dialect: str | None = None) -> str:
     """
-    Split the CTE definitions (as found in the WITH clause) into individual definitions,
-    taking care not to split on commas within nested parentheses.
+    Inline every CTE back into the main query.
     """
-    definitions = []
-    current = []
-    level = 0
-    for char in cte_definitions:
-        if char == '(':
-            level += 1
-            current.append(char)
-        elif char == ')':
-            level -= 1
-            current.append(char)
-        elif char == ',' and level == 0:
-            definitions.append(''.join(current).strip())
-            current = []
-        else:
-            current.append(char)
-    if current:
-        definitions.append(''.join(current).strip())
-    return definitions
+    ast = sqlglot.parse_one(sql, read=dialect)
 
+    with_clause: exp.With | None = ast.args.get("with")
+    if with_clause is None:
+        return sql
 
-def extract_cte_definitions(query: str) -> tuple[str, str]:
-    """
-    Given a query starting with WITH, extract the CTE definitions part and the main query.
-    This function reads character-by-character and uses parenthesis balancing to determine
-    where the CTE definitions end and the main query begins.
-    Returns a tuple: (cte_definitions_str, main_query).
-    """
-    # Remove the initial "WITH" keyword.
-    remaining = re.sub(r"(?is)^\s*WITH\s+", "", query, count=1)
-    cte_part = []
-    i = 0
-    depth = 0
-    length = len(remaining)
-    main_query_start = None
-    while i < length:
-        # At depth 0, check if the remaining text begins with a DML keyword.
-        if depth == 0:
-            m = re.match(r"(?i)^(SELECT|INSERT|UPDATE|DELETE)\b", remaining[i:])
-            if m:
-                main_query_start = i
-                break
-        char = remaining[i]
-        cte_part.append(char)
-        if char == '(':
-            depth += 1
-        elif char == ')':
-            depth -= 1
-        i += 1
-    if main_query_start is None:
-        return "".join(cte_part).strip(), ""
-    cte_definitions_str = "".join(cte_part).strip()
-    main_query = remaining[main_query_start:].strip()
-    return cte_definitions_str, main_query
+    # Build alias -> Select mapping
+    cte_map: dict[str, exp.Select] = {}
+    scalar_aliases: set[str] = set()
 
+    for cte in with_clause.find_all(exp.CTE):
+        alias = cte.alias_or_name
+        subq: exp.Select = cte.this
+        cte_map[alias] = subq
+        if _is_scalar_query(subq):
+            scalar_aliases.add(alias)
 
-def transform_ctes_to_subqueries(query: str) -> str:
-    """
-    Reverse the transformation done by transform_subqueries_to_ctes().
-    If the query starts with a WITH clause defining CTEs, this function extracts those
-    definitions and substitutes the CTE references in the main query with the original subqueries.
+    ast.set("with", None)  # strip WITH‑clause
 
-    It also removes any CROSS JOINs inserted for scalar subqueries.
-    """
+    # Transformer callback
+    def _inline(node: exp.Expression):
+        # Drop CROSS JOIN cte_n
+        if (
+                isinstance(node, exp.Join)
+                and node.kind.upper() == "CROSS"
+                and isinstance(node.this, exp.Table)
+                and node.this.name in cte_map
+        ):
+            return False
 
-    query = sqlparse.format(query, strip_comments=True)
+        # FROM/JOIN table
+        if isinstance(node, exp.Table) and node.name in cte_map:
+            return exp.Subquery(this=cte_map[node.name].copy()).alias(node.alias_or_name)
 
-    # Only process if the query starts with WITH.
-    if not re.match(r"(?is)^\s*WITH\s+", query):
-        return query
+        # Scalar column cte_n.val ⟶ (SELECT …)
+        if isinstance(node, exp.Column) and node.table in scalar_aliases:
+            return exp.Subquery(this=cte_map[node.table].copy())
 
-    # Extract the CTE definitions block and the main query using the custom parser.
-    cte_definitions_str, main_query = extract_cte_definitions(query)
-    if not main_query:
-        return query
+        return node  # keep unchanged
 
-    # Split individual CTE definitions.
-    cte_def_list = split_cte_definitions(cte_definitions_str)
-    alias_to_subquery = {}
-    # Extract the alias and subquery text from each definition.
-    # Each definition is assumed to be of the form: alias AS ( subquery )
-    for cte_def in cte_def_list:
-        m_cte = re.match(r"(?is)^\s*(\S+)\s+AS\s*\((.*)\)\s*$", cte_def, flags=re.DOTALL)
-        if m_cte:
-            alias = m_cte.group(1).strip()
-            subquery_text = m_cte.group(2).strip()
-            alias_to_subquery[alias] = subquery_text
+    inlined_ast = ast.transform(_inline)
 
-    # For each CTE alias, remove any inserted CROSS JOINs and replace alias references in the main query.
-    for alias, subquery in alias_to_subquery.items():
-        # Remove any CROSS JOIN clauses for this alias.
-        main_query = re.sub(rf"(?is)\s+CROSS\s+JOIN\s+{alias}\b", " ", main_query)
-        # First, replace qualified references (e.g. cte_0.val) with the inline subquery.
-        main_query = re.sub(rf"(?<!\w){alias}\.val\b", f"({subquery})", main_query)
-        # Then, replace unqualified references to the alias.
-        main_query = re.sub(rf"(?<!\w){alias}\b", f"({subquery})", main_query)
-
-    # Optionally, format the final query.
-    final_query = sqlparse.format(main_query, reindent=True, keyword_case='upper')
-    return final_query
-
-
-# Example usage:
-if __name__ == "__main__":
-    original_query = """
-    SELECT a, 
-           (SELECT MAX(c) FROM table2) as max_c,
-           (SELECT MIN(d) FROM table3) as min_d
-    FROM table1
-    WHERE a > (SELECT AVG(e) FROM table4)
-    """
-
-    # Transform subqueries to CTEs.
-    cte_query = transform_subqueries_to_ctes(original_query)
-    print("Query with CTEs:")
-    print(cte_query)
-    print("\n-----------------\n")
-
-    # Reverse: Transform CTEs back to inline subqueries.
-    reversed_query = transform_ctes_to_subqueries(cte_query)
-    print("Reversed query (CTEs to subqueries):")
-    print(reversed_query)
+    return sqlparse.format(
+        inlined_ast.sql(dialect=dialect),
+        reindent=True,
+        keyword_case="upper",
+    )
