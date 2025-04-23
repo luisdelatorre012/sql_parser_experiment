@@ -2,8 +2,8 @@
 sql_subquery_cte_transformer
 ============================
 
-Bidirectional transformation between inline sub‑queries and
-Common Table Expressions (CTEs).
+Bidirectional transformation between inline sub-queries and
+Common-Table-Expressions (CTEs), using only sqlglot’s AST.
 
 Public API
 ----------
@@ -13,382 +13,244 @@ MultipleQueriesError
 """
 
 from __future__ import annotations
-
-import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Set
 
 import sqlglot
-import sqlparse
-from sqlparse import tokens as sqlparse_tokens
-from sqlglot.expressions import alias_
-from sqlglot.dialects import DIALECTS
 from sqlglot import exp
+from sqlglot.dialects import DIALECTS
+from sqlglot.expressions import alias_
 
-DEFAULT_DIALECT: str | None = None  # change to "postgres", "mysql", … if desired
-
-
-# ---------------------------------------------------------------------------#
-# Public exceptions
-# ---------------------------------------------------------------------------#
+DEFAULT_DIALECT: str | None = None  # e.g. "postgres", "mysql", …
 
 
 class MultipleQueriesError(Exception):
-    """Raised when more than one top‑level SQL statement is supplied."""
-
-
-# ---------------------------------------------------------------------------#
-# Regexes – pre‑compiled for speed
-# ---------------------------------------------------------------------------#
-
-RE_SET_OP = re.compile(r"\b(?:UNION|INTERSECT|EXCEPT)\b", re.I)
-RE_EXISTS = re.compile(r"\b(?:NOT\s+)?EXISTS\b", re.I)
-RE_WINDOW = re.compile(r"\bOVER\s*\(", re.I)
-RE_FROM_OR_JOIN = re.compile(r"\b(?:FROM|JOIN)\s+([^\s,;()]+)", re.I)
-RE_ALIAS = re.compile(r"\bAS\s+([A-Z_][A-Z0-9_$]*)", re.I)
+    """Raised when more than one top-level SQL statement is supplied."""
 
 
 def _validate_dialect(name: str | None) -> str | None:
     if name is None:
         return DEFAULT_DIALECT
-
-    name = name.lower()
-    if name not in [i.lower() for i in DIALECTS]:
+    n = name.lower()
+    if n not in {d.lower() for d in DIALECTS}:
         raise ValueError(
             f"Unknown sqlglot dialect '{name}'. "
             f"Choose one of: {', '.join(sorted(DIALECTS))}"
         )
-    return name
-
-
-# ---------------------------------------------------------------------------#
-# Helper dataclasses
-# ---------------------------------------------------------------------------#
-
-
-def _tables_in_from(from_clause: exp.From) -> set[str]:
-    """
-    Return table names that are direct FROM or JOIN sources.
-    Ignores tables referenced only in projections or nested sub‑queries.
-    """
-    names: set[str] = set()
-
-    # Main source after FROM
-    if isinstance(from_clause.this, exp.Table):
-        names.add(from_clause.this.name)
-
-    # Each JOIN X ...
-    for join in from_clause.args.get("joins", []):
-        if isinstance(join.this, exp.Table):
-            names.add(join.this.name)
-
-    return names
+    return n
 
 
 @dataclass
 class _TransformState:
-    """Keeps all mutable state during a single transformation."""
-
     counter: int = 0
-    mapping: Dict[str, str] = field(default_factory=dict)  # norm_sql -> alias
+    mapping: Dict[str, str] = field(default_factory=dict)   # normalized_sql → cte_n
     cte_definitions: List[str] = field(default_factory=list)
-    scalar_aliases: Set[str] = field(default_factory=set)
-    used_names: Set[str] = field(default_factory=set)
+    scalar_aliases: Set[str] = field(default_factory=set)   # names of 1×1 CTEs
+    used_names:   Set[str] = field(default_factory=set)     # top-level tables & aliases
 
     def next_alias(self) -> str:
-        """Return the next `cte_n` name that doesn't clash with existing names."""
         while True:
-            alias = f"cte_{self.counter}"
+            name = f"cte_{self.counter}"
             self.counter += 1
-            if alias.upper() not in self.used_names:
-                self.used_names.add(alias.upper())
-                return alias
-
-
-# ---------------------------------------------------------------------------#
-# Utility helpers
-# ---------------------------------------------------------------------------#
-
-# ---------------------------------------------------------------------------
-#  Hoist derived tables  (FROM (SELECT …) alias)  → WITH cte_n AS ( … )
-# ---------------------------------------------------------------------------
-def _lift_inline_views(root: exp.Expression, state: _TransformState, dialect: str | None):
-    """
-    • Find every Subquery used as a row‑source (FROM / JOIN).
-    • Create or re‑use a CTE name.
-    • Replace the Subquery node with Table(cte_name).alias(original_alias).
-    """
-    for parent in root.find_all((exp.From, exp.Join)):
-        sub = parent.this                        # the expression *after* FROM / JOIN
-        if not (isinstance(sub, exp.Subquery) and isinstance(sub.this, exp.Select)):
-            continue                             # not a derived table
-
-        alias_exp = parent.args.get("alias")
-        alias_name = alias_exp.name if alias_exp else None
-        if not alias_name:                       # derived table without alias -> skip
-            continue
-
-        inner_sql = sub.this.sql(dialect=dialect)
-        norm_sql = _normalize_sql(inner_sql)
-
-        if norm_sql not in state.mapping:
-            cte_name = state.next_alias()
-            state.mapping[norm_sql] = cte_name
-            state.cte_definitions.append(_make_cte_sql(inner_sql, cte_name, dialect=dialect))
-        else:
-            cte_name = state.mapping[norm_sql]
-
-        # Replace Subquery with Table reference, keep original alias
-        parent.set("this", exp.Table(this=cte_name))
-        # nothing to change for alias; it's already there
-
+            if name.upper() not in self.used_names:
+                self.used_names.add(name.upper())
+                return name
 
 
 def _normalize_sql(sql: str) -> str:
-    """Collapse whitespace and upper‑case for dictionary keys."""
-    return re.sub(r"\s+", " ", sql).strip().upper()
+    # collapse whitespace + uppercase for stable dedupe keys
+    return " ".join(sql.split()).upper()
 
 
-def _outer_table_aliases(sql: str) -> set[str]:
-    """
-    Collect table *names* **and** *aliases* that appear in FROM / JOIN clauses.
-    Used only to avoid alias collisions and detect correlation.
-    """
+def _tables_in_from(frm: exp.From) -> set[str]:
     names: set[str] = set()
-
-    # ❶ Table names
-    for m in RE_FROM_OR_JOIN.finditer(sql):
-        names.add(m.group(1).upper())
-
-    # ❷ Aliases — pattern: FROM table  alias   or  JOIN table  alias
-    for m in re.finditer(r"\b(?:FROM|JOIN)\s+[^\s,;()]+\s+([A-Z_][A-Z0-9_$]*)", sql, re.I):
-        names.add(m.group(1).upper())
-
-    # ❸ Aliases introduced with AS
-    names.update(m.group(1).upper() for m in RE_ALIAS.finditer(sql))
-
+    if isinstance(frm.this, exp.Table):
+        names.add(frm.this.name.upper())
+    for j in frm.args.get("joins", []):
+        if isinstance(j.this, exp.Table):
+            names.add(j.this.name.upper())
     return names
 
 
-def _is_scalar_query(select_expr: exp.Select) -> bool:
+def _outer_table_aliases(sql: str, *, dialect: str | None) -> set[str]:
     """
-    Return True if the SELECT is judged to be scalar (one row, one column).
-    Heuristics are enough for this transformer.
+    Return just the top-level tables & aliases in the outer query's FROM/JOIN.
     """
-    # Aggregate without GROUP BY
-    if select_expr.args.get("group") is None:
-        if any(isinstance(node, exp.AggFunc) for node in select_expr.find_all(exp.AggFunc)):
-            return True
+    root = sqlglot.parse_one(sql, read=dialect)
+    names: set[str] = set()
+    frm = root.args.get("from")
+    if isinstance(frm, exp.From):
+        tbl = frm.this
+        if isinstance(tbl, exp.Table):
+            names.add(tbl.name.upper())
+            if tbl.alias and tbl.alias.name:
+                names.add(tbl.alias.name.upper())
+        for j in frm.args.get("joins", []):
+            t = j.this
+            if isinstance(t, exp.Table):
+                names.add(t.name.upper())
+                if t.alias and t.alias.name:
+                    names.add(t.alias.name.upper())
+    return names
 
-    # Single constant projection
-    items = select_expr.expressions
-    if len(items) == 1 and isinstance(items[0], (exp.Literal, exp.Anonymous)):
+
+def _is_scalar_query(sel: exp.Select) -> bool:
+    # aggregate w/o GROUP BY or single literal/anonymous
+    if sel.args.get("group") is None and any(isinstance(n, exp.AggFunc) for n in sel.find_all(exp.AggFunc)):
         return True
+    exps = sel.expressions
+    return len(exps) == 1 and isinstance(exps[0], (exp.Literal, exp.Anonymous))
 
-    return False
+
+def _contains_set_op(node: exp.Expression) -> bool:
+    return bool(node.find(exp.Union) or node.find(exp.Intersect) or node.find(exp.Except))
+
+
+def _contains_exists(node: exp.Expression) -> bool:
+    return node.find(exp.Exists) is not None
+
+
+def _contains_window(node: exp.Expression) -> bool:
+    return node.find(exp.Window) is not None
 
 
 def _make_cte_sql(inner_sql: str, alias: str, *, dialect: str | None) -> str:
-    dialect = _validate_dialect(dialect)
-    """
-    Build `alias AS ( … )`.  If the sub‑query is scalar, force its projection
-    to have a column named `val`.
-    """
-    parsed = sqlglot.parse_one(inner_sql, read=dialect)
-
-    if isinstance(parsed, exp.Select) and _is_scalar_query(parsed):
-        proj = parsed.expressions[0]
+    sel = sqlglot.parse_one(inner_sql, read=dialect)
+    if isinstance(sel, exp.Select) and _is_scalar_query(sel):
+        proj = sel.expressions[0]
         if not proj.alias_or_name:
-            parsed.set("expressions", [alias_(proj.copy(), "val")])
-
-    return f"{alias} AS ({parsed.sql(dialect=dialect).rstrip(';')})"
-
-
-# ---------------------------------------------------------------------------#
-# 1) sub‑query  ->  CTE
-# ---------------------------------------------------------------------------#
+            sel.set("expressions", [alias_(proj.copy(), "val")])
+    body = sel.sql(dialect=dialect).rstrip(";")
+    return f"{alias} AS ({body})"
 
 
 def transform_subqueries_to_ctes(
-        sql: str,
-        *,
-        dialect: str | None = None,
+    sql: str,
+    *,
+    dialect: str | None = None,
 ) -> str:
-    """
-    Hoist uncorrelated sub‑queries into WITH‑CTEs.
-
-    * Derived tables  (FROM (SELECT …) alias)     →  WITH cte_n AS ( … )
-    * Scalar sub‑queries                          →  WITH cte_n AS ( … ) + .val
-    * EXISTS / correlated / set‑ops sub‑queries   →  left untouched
-    """
-
     dialect = _validate_dialect(dialect)
 
-    # ── 1 Pre‑flight ----------------------------------------------------
-    statements = sqlparse.parse(sql)
-    if len(statements) != 1:
+    # 1) Ensure exactly one statement
+    stmts = sqlglot.parse(sql, read=dialect)
+    if len(stmts) != 1:
         raise MultipleQueriesError("Exactly one SQL statement is required.")
-    raw = sqlparse.format(sql, strip_comments=True).strip()
+    root = stmts[0]
 
+    # 2) Prepare state & record outer table names
+    raw = sql
     state = _TransformState()
-    state.used_names.update(_outer_table_aliases(raw))
+    state.used_names.update(_outer_table_aliases(raw, dialect=dialect))
 
-    # parse once – we’ll mutate the tree
-    root = sqlglot.parse_one(raw, read=dialect)
-
-    # ── 2 Hoist *derived tables* (inline views) via AST -----------------
-    _lift_inline_views(root, state, dialect)
-
-    # reflect any mutations in the working SQL string
-    transformed_sql = root.sql(dialect=dialect)
-
-    # ── 3 Find remaining Parenthesis tokens (scalar / predicate) --------
-    parsed_stmt = sqlparse.parse(transformed_sql)[0]
-    subqueries: list[sqlparse.sql.Parenthesis] = []
-
-    def _gather(tokens: list[sqlparse.sql.Token]) -> None:
-        for tok in tokens:
-            if isinstance(tok, sqlparse.sql.Parenthesis):
-                if any(
-                        t.ttype is sqlparse.tokens.DML and t.value.upper() == "SELECT"
-                        for t in tok.tokens
-                ):
-                    subqueries.append(tok)
-            if tok.is_group:
-                _gather(list(tok.tokens))
-
-    _gather(list(parsed_stmt.tokens))
-
-    # ── 4 Process scalar / predicate sub‑queries ------------------------
-    for sub in subqueries:
-        # skip EXISTS (…)
-        _, prev_tok = sub.token_prev(-1)
-        if prev_tok and prev_tok.ttype is sqlparse_tokens.Keyword and prev_tok.value.upper() == "EXISTS":
+    # 3) Hoist derived tables (FROM (SELECT…) alias)
+    for parent in root.find_all((exp.From, exp.Join)):
+        sub = parent.this
+        if not isinstance(sub, exp.Subquery) or not isinstance(sub.this, exp.Select):
             continue
+        alias_exp = parent.args.get("alias")
+        if not alias_exp or not alias_exp.name:
+            continue
+        inner = sub.this.sql(dialect=dialect)
+        key = _normalize_sql(inner)
+        if key not in state.mapping:
+            cte = state.next_alias()
+            state.mapping[key] = cte
+            state.cte_definitions.append(_make_cte_sql(inner, cte, dialect=dialect))
+        parent.set("this", exp.Table(this=state.mapping[key]))
 
-        inner_sql = str(sub)[1:-1].strip()
+    # 4) Hoist scalar sub-queries in projections / predicates
+    def _lift_scalar(node: exp.Expression):
+        if not isinstance(node, exp.Subquery) or not isinstance(node.this, exp.Select):
+            return node
+        # skip inline-view contexts
+        if isinstance(node.parent, (exp.From, exp.Join)):
+            return node
 
-        if RE_SET_OP.search(inner_sql) or RE_EXISTS.search(inner_sql):
-            continue  # set-ops or EXISTS inside the sub‑query
+        sel = node.this
+        scalar = _is_scalar_query(sel)
+        # skip disallowed subqueries
+        if _contains_set_op(sel) or _contains_exists(sel) or (scalar and _contains_window(sel)):
+            return node
+        # skip correlated scalars
+        if scalar:
+            refs = {t.name.upper() for t in sel.find_all(exp.Table)}
+            if refs & state.used_names:
+                return node
 
-        norm_sql = _normalize_sql(inner_sql)
-        alias = state.mapping.get(norm_sql)
-        if alias is None:
-            select_ast = sqlglot.parse_one(inner_sql, read=dialect)
+        inner = sel.sql(dialect=dialect)
+        key = _normalize_sql(inner)
+        if key not in state.mapping:
+            cte = state.next_alias()
+            state.mapping[key] = cte
+            state.cte_definitions.append(_make_cte_sql(inner, cte, dialect=dialect))
+            if scalar:
+                state.scalar_aliases.add(cte)
 
-            # skip scalar+window OR correlated scalar
-            if _is_scalar_query(select_ast) and (
-                    RE_WINDOW.search(inner_sql)
-                    or any(tbl in inner_sql for tbl in state.used_names)
-            ):
-                continue
+        cte_name = state.mapping[key]
+        # always return cte_n.val; in SELECT this becomes `cte_n.val AS alias`
+        return exp.column("val", table=cte_name)
 
-            alias = state.next_alias()
-            state.mapping[norm_sql] = alias
-            state.cte_definitions.append(_make_cte_sql(inner_sql, alias, dialect=dialect))
+    root = root.transform(_lift_scalar)
 
-            if _is_scalar_query(select_ast):
-                state.scalar_aliases.add(alias)
-
-        transformed_sql = transformed_sql.replace(str(sub), alias, 1)
-
-    # ── 5 Qualify .val & add CROSS JOINs for scalar CTEs ----------------
-    for alias in state.scalar_aliases:
-        transformed_sql = re.sub(rf"(?<!\.)\b{alias}\b", f"{alias}.val", transformed_sql)
-
+    # 5) Inject CROSS JOINs for all scalar CTEs
     if state.scalar_aliases:
-        ast_final = sqlglot.parse_one(transformed_sql, read=dialect)
-        from_clause: exp.From | None = ast_final.args.get("from")
-
-        if from_clause is None:
-            first, *rest = list(state.scalar_aliases)
-            ast_final.set("from", exp.From(this=exp.Table(this=first)))
+        frm = root.args.get("from")
+        if not isinstance(frm, exp.From):
+            first, *rest = state.scalar_aliases
+            root.set("from", exp.From(this=exp.Table(this=first)))
             pending = set(rest)
         else:
-            existing = _tables_in_from(from_clause)
-            pending = state.scalar_aliases - existing
+            existing = _tables_in_from(frm)
+            pending = {a for a in state.scalar_aliases if a.upper() not in existing}
 
         for alias in pending:
-            ast_final.append("joins", exp.Join(this=exp.Table(this=alias), kind="cross"))
+            root.append("joins", exp.Join(this=exp.Table(this=alias), kind="cross"))
 
-        transformed_sql = ast_final.sql(dialect=dialect)
-
-    # ── 6 Prepend WITH‑clause if any CTEs were created ------------------
+    # 6) Pretty-print & prepend WITH
+    out = root.sql(dialect=dialect, pretty=True)
     if state.cte_definitions:
         with_clause = "WITH " + ",\n     ".join(state.cte_definitions)
-        transformed_sql = f"{with_clause}\n{transformed_sql}"
+        out = f"{with_clause}\n{out}"
 
-    # ── 7 Pretty‑print --------------------------------------------------
-    return sqlparse.format(transformed_sql, reindent=True, keyword_case="upper")
-
-
-# ---------------------------------------------------------------------------#
-# 2) CTE  ->  sub‑query
-# ---------------------------------------------------------------------------#
+    return out
 
 
 def transform_ctes_to_subqueries(
-        sql: str,
-        *,
-        dialect: str | None = None,
+    sql: str,
+    *,
+    dialect: str | None = None,
 ) -> str:
-    """
-    Inline every CTE back into the main query.
-    Parameters
-    ----------
-    sql : str
-        Input query containing inline sub‑queries.
-    dialect : str | None, default = None
-        One of sqlglot’s dialect names ("postgres", "bigquery", …).  When
-        None we parse with `DEFAULT_DIALECT`, which is currently
-        {!r}.format(DEFAULT_DIALECT or "sqlglot’s generic parser")
-    """
     dialect = _validate_dialect(dialect)
+    root = sqlglot.parse_one(sql, read=dialect)
+    with_clause = root.args.get("with")
+    if not isinstance(with_clause, exp.With):
+        return sqlglot.parse_one(sql, read=dialect).sql(pretty=True)
 
-    ast = sqlglot.parse_one(sql, read=dialect)
-
-    with_clause: exp.With | None = ast.args.get("with")
-    if with_clause is None:
-        return sql
-
-    # Build alias -> Select mapping
-    cte_map: dict[str, exp.Select] = {}
-    scalar_aliases: set[str] = set()
-
+    # build alias→AST map
+    cte_map: Dict[str, exp.Select] = {}
+    scalar_aliases: Set[str] = set()
     for cte in with_clause.find_all(exp.CTE):
-        alias = cte.alias_or_name
-        subq: exp.Select = cte.this
-        cte_map[alias] = subq
-        if _is_scalar_query(subq):
-            scalar_aliases.add(alias)
+        a = cte.alias_or_name
+        cte_map[a] = cte.this
+        if _is_scalar_query(cte.this):
+            scalar_aliases.add(a)
 
-    ast.set("with", None)  # strip WITH‑clause
+    root.set("with", None)
 
-    # Transformer callback
     def _inline(node: exp.Expression):
-        # Drop CROSS JOIN cte_n
-        if (
-                isinstance(node, exp.Join)
+        # drop CROSS JOIN cte_n
+        if (isinstance(node, exp.Join)
                 and node.kind.upper() == "CROSS"
                 and isinstance(node.this, exp.Table)
-                and node.this.name in cte_map
-        ):
+                and node.this.name in cte_map):
             return False
-
-        # FROM/JOIN table
+        # inline table
         if isinstance(node, exp.Table) and node.name in cte_map:
             return exp.Subquery(this=cte_map[node.name].copy()).alias(node.alias_or_name)
-
-        # Scalar column cte_n.val ⟶ (SELECT …)
+        # inline scalar column
         if isinstance(node, exp.Column) and node.table in scalar_aliases:
             return exp.Subquery(this=cte_map[node.table].copy())
+        return node
 
-        return node  # keep unchanged
-
-    inlined_ast = ast.transform(_inline)
-
-    return sqlparse.format(
-        inlined_ast.sql(dialect=dialect),
-        reindent=True,
-        keyword_case="upper",
-    )
+    root = root.transform(_inline)
+    return root.sql(pretty=True)
